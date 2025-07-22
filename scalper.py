@@ -8,10 +8,10 @@ import time
 from datetime import datetime, time as dt_time, timedelta, time as dt_time
 import pytz
 import numpy as np
-from typing import Tuple, Optional, List, Any, Dict, Union 
+from typing import Tuple, Optional, List, Any, Dict, Union, Callable
 from dataclasses import dataclass
+from colorama import Fore
 from typing import TypedDict, NotRequired
-
 
 
 class MT5TypeHints:
@@ -581,6 +581,10 @@ class MT5Wrapper:
                 [(float(level.price), float(level.volume)) for level in depth.bid],
                 key=lambda x: -x[0]  # Sort by price descending
             )
+            # Add this after checking hasattr(depth, 'bid')
+            if not isinstance(depth.bid, (list, tuple)) or not isinstance(depth.ask, (list, tuple)):
+                print(f"Invalid market depth structure for {symbol}")
+                return None
             
             # Process asks (sort from lowest to highest)
             asks = sorted(
@@ -774,9 +778,9 @@ class RiskBreach(Exception):
 
 class RiskManager:
     """Handles all risk-related checks and operations"""
-    def __init__(self, config: dict, scalper=None):
+    def __init__(self, config: dict, pnl_calculator: Optional[Callable[[], float]] = None):
         self.config = config
-        self.scalper = scalper # Reference to Scalper instance
+        self._calculate_daily_pnl = pnl_calculator
         self.drawdown_start_balance = None
         
     
@@ -786,14 +790,12 @@ class RiskManager:
             self.drawdown_start_balance = current_equity
             return
             
-        # Safe PNL check if scalper reference exists
-        if hasattr(self, 'scalper') and self.scalper is not None:
+        # Safe access to PNL calculator
+        if self._calculate_daily_pnl is not None:
             try:
-                daily_pnl = self.scalper.calculate_daily_pnl()
+                daily_pnl = self._calculate_daily_pnl()  # Call the stored function
                 if daily_pnl < -0.5 * (self.config['max_daily_drawdown']/100) * self.drawdown_start_balance:
                     print(f"PNL Warning: ${daily_pnl:.2f}")
-            except AttributeError:
-                print("Warning: calculate_daily_pnl not available")
             except Exception as e:
                 print(f"PNL check failed: {str(e)}")
 
@@ -817,7 +819,10 @@ class Scalper:
     
     def __init__(self, risk_percent: float = 0.5, risk_reward: float = 1.5):
         self._verify_broker_conditions() 
-        self.risk_manager = RiskManager(self.config, scalper=self)
+        self.risk_manager = RiskManager(
+            config=self.config,
+            pnl_calculator=self.calculate_daily_pnl  # Pass the method directly
+        )
         self.last_trade_time = {}
         self.config = {
             'risk_percent': risk_percent,
@@ -847,7 +852,10 @@ class Scalper:
             }
         })
 
-        self.risk_manager = RiskManager(self.config, scalper=self)  # Pass self reference
+        self.config['volatility_thresholds'].update({
+            'EURUSD': {'off_peak_reduction': 0.65},  # 35% reduction
+            'USDJPY': {'off_peak_reduction': 0.75}   # 25% reduction
+        })
 
         self.min_acceptable_volatility = {
             'EURUSD': 0.0003,
@@ -955,24 +963,35 @@ class Scalper:
         return dt_time(16, 0) <= now <= dt_time(17, 5)  # 5-min buffer
 
     def calculate_position_size(self, symbol: str, entry: float, stop_loss: float) -> float:
-        """Risk-based position sizing with contract size"""
+        """Enhanced risk-based sizing with volatility scaling"""
         account = MT5Wrapper.get_account_info()
         if not account:
             return 0.0
         
-        # Access balance from the account dictionary
+        # 1. Original risk calculation (unchanged)
         risk_amount = account.get('balance', 0.0) * (self.config['risk_percent'] / 100)
         point = self.symbols[symbol]['point']
         risk_points = abs(entry - stop_loss) / point
         
-        # Currency-specific pip value
+        # Currency-specific pip value (unchanged)
         if "JPY" in symbol:
             pip_value = 1000 / entry  # JPY pairs
         else:
             pip_value = 10  # Non-JPY pairs
         
-        size = risk_amount / (risk_points * point * pip_value)
-        return self._normalize_volume(symbol, size)
+        # 2. Base size calculation (unchanged)
+        base_size = risk_amount / (risk_points * point * pip_value)
+        
+        # 3. ➕ NEW: Volatility Adjustment (Single Block)
+        if hasattr(self, 'min_acceptable_volatility'):  # Safe check
+            current_atr = self.calculate_atr(symbol)
+            if current_atr > 0:
+                # Dynamic scaling (0.8x to 1.5x multiplier)
+                atr_ratio = current_atr / self.min_acceptable_volatility.get(symbol[:3], 0.0005)
+                volatility_factor = min(1.5, max(0.8, atr_ratio))
+                base_size *= volatility_factor
+        
+        return self._normalize_volume(symbol, base_size)
 
     def calculate_atr(self, symbol: str, timeframe: int = MT5Wrapper.TIMEFRAME_M5, period: int = 14) -> float:
         """
@@ -1021,6 +1040,8 @@ class Scalper:
 
     def entry_signal(self, symbol: str) -> Optional[str]:
         """Enhanced multi-factor entry signal with weighted confirmations"""
+        if self.config.get('debug', False):
+            self.show_order_flow(symbol)
         try:
             # Get data for multiple timeframes
             m1_rates = MT5Wrapper.get_rates(symbol, MT5Wrapper.TIMEFRAME_M1, 0, 15)
@@ -1263,6 +1284,12 @@ class Scalper:
             
         # Position size calculation
         size = self.calculate_position_size(symbol, entry, stop_loss)
+        size = self._get_safe_position_size(
+            symbol=symbol,
+            target_size=size,
+            is_buy=(signal == 'buy')  # Convert signal to boolean
+        )
+        size = self._time_adjusted_size(symbol, size)
         self.config['risk_percent'] = min(max(self.config['risk_percent'], 0.1), 2.0)
             
         if size <= 0:
@@ -1346,6 +1373,51 @@ class Scalper:
         
         print(f"Trade executed: {symbol} {signal} at {entry} ({size:.2f} lots)")
         return True
+
+    def _get_safe_position_size(self, symbol: str, target_size: float, is_buy: bool) -> float:
+        """
+        Type-safe liquidity check that prevents oversized orders
+        Args:
+            symbol: Trading instrument (e.g. "EURUSD")
+            target_size: Original calculated position size
+            is_buy: True for buy orders, False for sell orders
+        Returns:
+            Adjusted position size respecting liquidity limits
+        """
+        # 1. Apply maximum lot size constraint
+        max_lots = self.symbols[symbol].get('volume_max', 100)
+        size = min(target_size, max_lots)
+
+        # 2. Check market liquidity
+        depth = MT5Wrapper.get_market_depth(symbol)
+        if not depth or not isinstance(depth, dict):
+            return size  # Return size after max lots check
+
+        bids = depth.get('bid', [])
+        asks = depth.get('ask', [])
+        
+        if not isinstance(bids, list) or not isinstance(asks, list):
+            return size  # Return size after max lots check
+
+        # 3. Process relevant side (bids for sells, asks for buys)
+        levels = asks if is_buy else bids
+        valid_volumes = []
+        
+        for level in levels[:3]:  # Top 3 price levels
+            if isinstance(level, (tuple, list)) and len(level) >= 2:
+                try:
+                    volume = float(level[1])
+                    if volume >= 0:  # Only accept valid volumes
+                        valid_volumes.append(volume)
+                except (TypeError, ValueError):
+                    continue
+
+        # 4. Apply liquidity constraint (max 20% of available volume)
+        if valid_volumes:
+            available_liquidity = sum(valid_volumes)
+            return min(size, available_liquidity * 0.2)
+        
+        return size  # Fallback to max-lots-constrained size
 
     def _handle_partial_fill(self, result: Dict[str, Any], symbol: str, signal: str) -> None:
         """
@@ -1919,6 +1991,40 @@ class Scalper:
             
         return min(MAX_RISK, max(MIN_RISK, adjusted))
 
+    def show_order_flow(self, symbol: str) -> None:
+        """Safe order flow display with type checking"""
+        depth = MT5Wrapper.get_market_depth(symbol)
+        if not depth or not isinstance(depth, dict):
+            print(f"No valid depth data for {symbol}")
+            return
+
+        def safe_volume_sum(levels: Any) -> float:
+            """Handle both MT5 DepthLevel objects and raw tuples/lists"""
+            if not levels:
+                return 0.0
+                
+            # Case 1: List of DepthLevel objects (from MT5)
+            if hasattr(levels[0], 'price') and hasattr(levels[0], 'volume'):
+                return sum(float(level.volume) for level in levels)
+                
+            # Case 2: List of tuples (price, volume)
+            elif isinstance(levels[0], (tuple, list)) and len(levels[0]) >= 2:
+                return sum(float(v) for _, v in levels)
+                
+            return 0.0
+
+        try:
+            bid_vol = safe_volume_sum(depth.get('bid', []))
+            ask_vol = safe_volume_sum(depth.get('ask', []))
+            
+            print(f"\n{symbol} Order Flow:")
+            print(f"Total Bid Volume: {bid_vol:.2f}")
+            print(f"Total Ask Volume: {ask_vol:.2f}")
+            print(f"Imbalance Ratio: {(bid_vol - ask_vol)/max(bid_vol, ask_vol, 1):+.2%}")
+            
+        except Exception as e:
+            print(f"Order flow error: {str(e)}")
+
     def run(self):
         """Robust main trading loop with proper dictionary access and error handling"""
         print("Starting scalping bot...")
@@ -2140,10 +2246,28 @@ class Scalper:
                     print(f"Error during backtest for {symbol} at index {i}: {str(e)}")
                     continue
 
+    def _time_adjusted_size(self, symbol: str, size: float) -> float:
+        """Time-based position sizing with symbol-specific adjustments"""
+        now = datetime.now(pytz.timezone('Europe/London')).time()
+        
+        # 1. Get symbol-specific configuration
+        pair_config = self.config['volatility_thresholds'].get(symbol[:6], {})
+        base_reduction = pair_config.get('off_peak_reduction', 0.7)  # Default 30% reduction
+        
+        # 2. Lunch hours reduction (all pairs)
+        if dt_time(12, 0) <= now <= dt_time(13, 30):
+            return size * 0.6  # 40% reduction during lunch
+                
+        # 3. Full size during active sessions
+        if self._is_london_open() or self._is_ny_close():
+            return size
+                
+        # 4. Apply symbol-specific reduction for off-peak
+        return size * base_reduction
+                    
+
 
 if __name__ == "__main__":
-    import argparse
-    from datetime import datetime, timedelta
 
     parser = argparse.ArgumentParser(description='Scalper Trading Bot')
     parser.add_argument('--backtest', action='store_true', help='Run in backtest mode')

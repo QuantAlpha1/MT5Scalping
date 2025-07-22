@@ -5,6 +5,86 @@ import numpy as np
 from typing import List, Dict, Optional
 import json
 
+
+import MetaTrader5 as mt5
+from typing import Optional, Any
+from datetime import datetime
+import pandas as pd
+
+
+class MT5TypeHints:
+    """Static type hints for MetaTrader5 functions"""
+    
+    @staticmethod
+    def initialize() -> bool: ...
+    
+    @staticmethod
+    def shutdown() -> None: ...
+    
+    @staticmethod
+    def copy_rates_range(symbol: str, timeframe: int, start: datetime, end: datetime) -> Optional[np.ndarray]: ...
+    
+    @staticmethod
+    def TIMEFRAME_M1() -> int: ...
+    
+    @staticmethod
+    def TIMEFRAME_M5() -> int: ...
+    
+    @staticmethod
+    def TIMEFRAME_H1() -> int: ...
+    
+    @staticmethod
+    def TIMEFRAME_D1() -> int: ...
+
+
+class MT5BacktestWrapper:
+    """Type-safe wrapper for backtesting operations"""
+    
+    @staticmethod
+    def initialize() -> bool:
+        """Initialize MT5 connection with type safety"""
+        result = mt5.initialize()  # type: ignore
+        return bool(result)
+
+    @staticmethod
+    def shutdown() -> None:
+        """Shutdown MT5 connection with type safety"""
+        mt5.shutdown()  # type: ignore
+
+    @staticmethod
+    def copy_rates_range(
+        symbol: str,
+        timeframe: int,
+        start: datetime,
+        end: datetime
+    ) -> Optional[pd.DataFrame]:
+        """
+        Safe historical data retrieval with:
+        - Type checking
+        - Error handling
+        - Pandas conversion
+        """
+        rates = mt5.copy_rates_range(symbol, timeframe, start, end)  # type: ignore
+        if rates is None or len(rates) == 0:
+            return None
+            
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        return df.set_index('time')
+
+    @staticmethod
+    def get_timeframe(timeframe: str) -> int:
+        """Convert timeframe string to MT5 constant with type safety"""
+        timeframe_map = {
+            'M1': mt5.TIMEFRAME_M1,  # type: ignore
+            'M5': mt5.TIMEFRAME_M5,  # type: ignore
+            'H1': mt5.TIMEFRAME_H1,  # type: ignore
+            'D1': mt5.TIMEFRAME_D1   # type: ignore
+        }
+        return timeframe_map.get(timeframe.upper(), mt5.TIMEFRAME_M1)  # type: ignore
+    
+    
+
 class ScalperBacktester:
     def __init__(self):
         self.config = {
@@ -13,26 +93,26 @@ class ScalperBacktester:
             'magic_number': 234000
         }
         self.trade_log = []
+
+        self.mt5 = MT5BacktestWrapper()
         
     def load_historical_data(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-        """Load MT5 historical data for backtesting"""
-        if not mt5.initialize():
+        """Safe data loading with error handling"""
+        if not self.mt5.initialize():
             raise ConnectionError("MT5 initialization failed")
             
-        rates = mt5.copy_rates_range(
-            symbol,
-            mt5.TIMEFRAME_M1,
-            start,
-            end
-        )
-        mt5.shutdown()
-        
-        if rates is None:
-            raise ValueError(f"No data for {symbol}")
-            
-        df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        return df
+        try:
+            df = self.mt5.copy_rates_range(
+                symbol,
+                self.mt5.get_timeframe('M1'),  # Using wrapper's timeframe conversion
+                start,
+                end
+            )
+            if df is None:
+                raise ValueError(f"No data for {symbol}")
+            return df
+        finally:
+            self.mt5.shutdown()
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         """Your exact ATR calculation from live strategy"""
@@ -160,6 +240,7 @@ class ScalperBacktester:
         print(f"Total Trades: {len(results)}")
         print(f"Win Rate: {win_rate:.1%}")
         print(f"Total PnL: ${results['pnl'].sum():.2f}")
+
 
 if __name__ == "__main__":
     tester = ScalperBacktester()
