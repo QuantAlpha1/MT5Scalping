@@ -33,11 +33,7 @@ A professional-grade algorithmic trading bot for MetaTrader 5, specializing in s
 - `MetaTrader5` Python package
 - `pandas`, `numpy`, `pytz`, `colorama`
 
-## Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/mt5-scalper.git
-cd mt5-scalper
+
 
 
