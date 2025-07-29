@@ -1,0 +1,45 @@
+{
+  "_comment": "MT5 Scalper Bot Configuration Example - Adjust values before use",
+  "core": {
+    "risk_percent": 0.5,
+    "risk_reward": 1.5,
+    "magic_number": 234000,
+    "max_spread": 2.0,
+    "max_trades": 3
+  },
+  "symbols": {
+    "EURUSD": {
+      "min_volatility": 0.0003,
+      "max_volatility": 0.002,
+      "volume_limits": [0.01, 100]
+    },
+    "USDJPY": {
+      "min_volatility": 0.03,
+      "max_volatility": 0.2,
+      "volume_limits": [0.01, 50]
+    }
+  },
+  "sessions": {
+    "trading_hours": ["08:00", "17:00"],
+    "timezone": "Europe/London",
+    "avoid_news": true
+  },
+  "technical": {
+    "entry_timeframe": "M1",
+    "trend_timeframe": "M5",
+    "atr_period": 14
+  },
+  "order_settings": {
+    "type_filling": "IOC",
+    "max_retries": 3,
+    "allow_partial": true
+  },
+  "risk_limits": {
+    "max_daily_drawdown": 2.0,
+    "equity_protection": 80.0
+  },
+  "notifications": {
+    "telegram": false,
+    "log_level": "INFO"
+  }
+}
