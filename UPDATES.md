@@ -1,4 +1,4 @@
-Symbol-specific spread settings:
+Symbol-specific spread settings: 
 
 {
   "symbol_settings": {
