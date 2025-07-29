@@ -1,5 +1,3 @@
-Institutional-Grade Scalping Trading Bot EUR-USD, USD-JPY
-
 # MT5 Scalping Trading Bot
 
 A professional-grade algorithmic trading bot for MetaTrader 5, specializing in scalping strategies for forex pairs like EURUSD and USDJPY.
